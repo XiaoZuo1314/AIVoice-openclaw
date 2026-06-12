@@ -5,8 +5,8 @@
 | 项目         | 内容                                              |
 | ------------ | ------------------------------------------------- |
 | **文档名称** | AIVoice 后端实现说明                              |
-| **版本**     | v1.1                                              |
-| **最后更新** | 2026-06-11                                        |
+| **版本**     | v1.4                                              |
+| **最后更新** | 2026-06-12                                        |
 | **作者**     | cloudzao                                          |
 | **对应阶段** | MVP - 阶段一：Spring Boot ↔ 本地 OpenClaw 对接   |
 | **配套文档** | [YoooClaw C·ONE 仿制产品架构设计文档.md](YoooClaw%20C·ONE%20仿制产品架构设计文档.md) |
@@ -33,9 +33,15 @@ flowchart LR
     Health["/actuator/health"] -.->|"GET /v1/models"| Gateway
 ```
 
-> 项目已接入 **springdoc-openapi 2.8.x**，所有对外 REST 接口的最新协议可在应用启动后通过
+> 项目已接入 **springdoc-openapi 2.8.17**，所有对外 REST 接口的最新协议可在应用启动后通过
 > `http://127.0.0.1:8080/swagger-ui.html` 在线查阅，无需依赖本文档手动维护。
 > 详见 [§ 6.1 在线 OpenAPI 文档（Swagger UI）](#61-在线-openapi-文档swagger-ui)。
+>
+> **多模块依赖管理铁律**：每次修改任意子模块的 `pom.xml`（新增/删除依赖、升级版本号）后，
+> **必须在仓库根目录执行 `./mvnw -DskipTests install` 一次**，把最新 pom 写入本地 `~/.m2` 仓库。
+> 否则用 `cd aivoice-app && ./mvnw spring-boot:run` 启动时，maven 会从本地仓库拉**陈旧的子模块 pom**，
+> 导致新加的依赖不进 classpath，运行期端点会以 `NoResourceFoundException` 形式 500（启动日志却干净无报错），
+> 排查极其费时。CI 与本地启动脚本应固定走 `mvn install` → `mvn spring-boot:run` 这条流水线。
 
 ---
 
@@ -178,31 +184,18 @@ public interface OpenClawClient {
 
 ### 3.2 业务编排层（aivoice-agent/service）
 
-[ChatService.java](../aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/service/ChatService.java) 不感知 HTTP 协议，仅做：
+[ChatService.java](../aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/service/ChatService.java) 不感知 HTTP 协议，提供同步与流式两条路径，共用一份请求构造逻辑：
 
-1. 解析 model（未传则用 `openclaw.default-model`）
-2. 解析 systemPrompt（未传则用内置默认人设）
-3. 组装 system + user 双消息序列
-4. 调用 `OpenClawClient.chatCompletion()`
-5. 抽取首条 choice 文本 + 封装 token 用量
+| 路径 | 入口 | 上游调用 | 输出 |
+| --- | --- | --- | --- |
+| 同步 | `chat(ChatRequest)` | `OpenClawClient.chatCompletion(...)` | `ChatResponse`（含 reply + token usage）|
+| 流式 | `chatStream(ChatRequest, SseEmitter)` | `OpenClawClient.chatCompletionStream(req, onContent, onComplete, onError)` | 通过 `SseEmitter` 逐 chunk 推 |
 
-```41:71:aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/service/ChatService.java
+两条路径共享私有 helper `buildUpstreamRequest(request, stream)`，避免 model / systemPrompt / messages 的解析逻辑分叉漂移：
+
+```44:57:aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/service/ChatService.java
     public ChatResponse chat(ChatRequest request) {
-        String model = StringUtils.hasText(request.model()) ? request.model() : properties.defaultModel();
-        String systemPrompt = StringUtils.hasText(request.systemPrompt())
-                ? request.systemPrompt()
-                : DEFAULT_SYSTEM_PROMPT;
-
-        List<ChatMessage> messages = new ArrayList<>(2);
-        messages.add(ChatMessage.system(systemPrompt));
-        messages.add(ChatMessage.user(request.message()));
-
-        ChatCompletionRequest upstream = new ChatCompletionRequest(
-                model,
-                messages,
-                Boolean.FALSE,
-                request.temperature());
-
+        ChatCompletionRequest upstream = buildUpstreamRequest(request, Boolean.FALSE);
         ChatCompletionResponse response = client.chatCompletion(upstream);
         String reply = response.firstContent().orElse("");
 
@@ -217,25 +210,52 @@ public interface OpenClawClient {
     }
 ```
 
+流式路径的关键约束：**任何异常都不能从 `chatStream` 签名抛出**，因为响应头此时通常已经发出，再走 `GlobalExceptionHandler` 返 problem+json 已无意义；统一通过 `SseEmitter.completeWithError(Throwable)` 让 Spring 决定如何中断响应。
+
+```74:81:aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/service/ChatService.java
+    public void chatStream(ChatRequest request, SseEmitter emitter) {
+        ChatCompletionRequest upstream = buildUpstreamRequest(request, Boolean.TRUE);
+        client.chatCompletionStream(
+                upstream,
+                content -> sendOrFail(emitter, content),
+                emitter::complete,
+                emitter::completeWithError);
+    }
+```
+
 ### 3.3 REST 接口层（aivoice-agent/controller）
 
-[ChatController.java](../aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/controller/ChatController.java) 极薄，仅做"参数校验 + 委托 Service"：
+[ChatController.java](../aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/controller/ChatController.java) 暴露 2 个端点，均极薄，仅做"参数校验 + 委托 Service"：
 
-```26:40:aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/controller/ChatController.java
-    private final ChatService chatService;
+| 端点 | 方法 | 媒体类型 | 用途 |
+| --- | --- | --- | --- |
+| `/chat` | `POST` | `application/json` | 同步问答 |
+| `/chat/stream` | `POST` | `text/event-stream` | SSE 流式问答（Python ASR 等中间服务消费） |
 
-    /**
-     * 同步对话接口。
-     *
-     * @param request 用户请求体
-     * @return HTTP 200 + 模型回复内容与 token 用量
-     */
-    @PostMapping("/chat")
-    public ResponseEntity<ChatResponse> chat(@Valid @RequestBody ChatRequest request) {
-        return ResponseEntity.ok(chatService.chat(request));
+**流式端点的请求体与同步端点完全一致（复用 `ChatRequest`）**，差别只在响应媒体类型与处理流程：
+
+```145:159:aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/controller/ChatController.java
+    @PostMapping(value = "/chat/stream",
+            consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter chatStream(@Valid @RequestBody ChatRequest request) {
+        SseEmitter emitter = new SseEmitter(STREAM_EMITTER_TIMEOUT_MS);
+        emitter.onTimeout(() -> {
+            log.info("SSE emitter timed out after {}ms, completing", STREAM_EMITTER_TIMEOUT_MS);
+            emitter.complete();
+        });
+        emitter.onError(throwable ->
+                log.warn("SSE emitter error (likely client disconnect): {}", throwable.getMessage()));
+        chatStreamExecutor.execute(() -> chatService.chatStream(request, emitter));
+        return emitter;
     }
-}
 ```
+
+**关键设计点**：
+
+- `chatStreamExecutor`（[AsyncConfig.java](../aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/config/AsyncConfig.java) 中定义的 `ThreadPoolTaskExecutor`，core=4 / max=16 / queue=64）专门承接流式任务，让 Tomcat 工作线程在创建 emitter 后立刻释放
+- 5 分钟空闲超时（`STREAM_EMITTER_TIMEOUT_MS`）覆盖最长上游推理；客户端断开时 `onError` 仅打 INFO 日志，不抛异常
+- 上游 OpenClaw 协议尾部的 `data: [DONE]` 哨兵在 [OpenClawHttpClient.java](../aivoice-agent/src/main/java/com/cloudzao/aivoice/agent/llm/OpenClawHttpClient.java) 内被吸收，**不会透传给客户端**；客户端按 SSE 标准等待连接关闭即可
 
 **对外 DTO 与上游协议 DTO 解耦**：
 
@@ -295,6 +315,25 @@ public record OpenClawProperties(
 ```
 
 > 后续若要切换到 Reactor `WebClient`（流式 SSE）或加上连接池（Apache HttpClient5），只需在本 Bean 内做替换，业务模块零修改。
+
+#### CorsProperties + CorsConfig - 全局跨域
+
+[CorsProperties.java](../aivoice-common/src/main/java/com/cloudzao/aivoice/common/config/CorsProperties.java) 把所有跨域参数收敛到 `aivoice.cors.*` 命名空间下；[CorsConfig.java](../aivoice-common/src/main/java/com/cloudzao/aivoice/common/config/CorsConfig.java) 实现 `WebMvcConfigurer.addCorsMappings(...)` 把配置注册到 Spring MVC 的 CORS 处理链。运行期效果：
+
+- `OPTIONS` 预检请求由 Spring 自动应答，无需在每个 Controller 上手写 `@CrossOrigin`
+- 同步 `/api/v1/agents/chat`、流式 `/api/v1/agents/chat/stream`、未来新增的所有 `/api/**` 端点均统一覆盖
+- `/actuator/**`、`/swagger-ui/**`、`/v3/api-docs/**` 不在 `path-pattern` 范围内 —— 这些是同源访问端点，无需跨域
+
+启动日志会打印当前生效配置，方便排查环境差异：
+
+```
+INFO ... CorsConfig : CORS configured: pathPattern=/api/**,
+  allowedOriginPatterns=[http://localhost:[*], http://127.0.0.1:[*], ...],
+  methods=[GET, POST, PUT, DELETE, OPTIONS, HEAD],
+  allowCredentials=false, maxAge=PT1H
+```
+
+详细配置项与运行时校验规则见 [§ 4.4 跨域（CORS）配置项](#44-跨域cors配置项)。
 
 ### 3.5 异常处理与统一错误响应（aivoice-common/exception）
 
@@ -450,6 +489,24 @@ springdoc:
   paths-to-match: /api/**
   default-produces-media-type: application/json
   show-actuator: false
+
+aivoice:
+  cors:
+    enabled: ${AIVOICE_CORS_ENABLED:true}
+    path-pattern: /api/**
+    allowed-origin-patterns:
+      - http://localhost:[*]
+      - http://127.0.0.1:[*]
+      - https://localhost:[*]
+      - https://127.0.0.1:[*]
+      - capacitor://localhost
+      - ionic://localhost
+      - http://localhost
+    allowed-methods: [GET, POST, PUT, DELETE, OPTIONS, HEAD]
+    allowed-headers: ["*"]
+    exposed-headers: [Content-Disposition]
+    allow-credentials: false
+    max-age: 1h
 ```
 
 ### 4.1 关键配置项
@@ -494,6 +551,58 @@ springdoc:
 > `springdoc.api-docs.enabled: false` 与 `springdoc.swagger-ui.enabled: false`，
 > 或通过 Spring Security 把 `/v3/api-docs/**` 与 `/swagger-ui/**` 限制到内部 IP。
 
+### 4.4 跨域（CORS）配置项
+
+[application.yaml](../aivoice-app/src/main/resources/application.yaml) 中 `aivoice.cors.*` 控制全局跨域行为，由 [CorsConfig.java](../aivoice-common/src/main/java/com/cloudzao/aivoice/common/config/CorsConfig.java) 注册到 Spring MVC 的 CORS 处理链：
+
+| Key | 默认 | 推荐来源 | 说明 |
+| --- | --- | --- | --- |
+| `aivoice.cors.enabled` | `true` | `AIVOICE_CORS_ENABLED` | 总开关；`false` 时本配置类不加载（`@ConditionalOnProperty`），恢复 Spring 默认无 CORS 行为 |
+| `aivoice.cors.path-pattern` | `/api/**` | yaml | CORS 生效路径；`/actuator/**`、`/swagger-ui/**`、`/v3/api-docs/**` **不在范围内**（同源访问，无需跨域） |
+| `aivoice.cors.allowed-origin-patterns` | localhost / capacitor 等 | `AIVOICE_CORS_ALLOWED_ORIGINS` | **不要写成 `allowed-origins`**，Spring 6.0+ 在 `allow-credentials=true` 时禁用 `*` origin，但 patterns 形式（`http://localhost:[*]`）支持通配 |
+| `aivoice.cors.allowed-methods` | `GET,POST,PUT,DELETE,OPTIONS,HEAD` | yaml | 允许的 HTTP 方法 |
+| `aivoice.cors.allowed-headers` | `["*"]` | yaml | 请求 header 白名单；阶段三接 JWT 后保持 `*` 即可（已隐含放行 `Authorization`） |
+| `aivoice.cors.exposed-headers` | `[Content-Disposition]` | yaml | 浏览器默认仅暴露 6 个 simple header；如未来 SSE / 文件下载要在响应中放自定义头需在此追加 |
+| `aivoice.cors.allow-credentials` | `false` | yaml | 当前阶段用 `Authorization: Bearer <jwt>` header 鉴权，不依赖 cookie；阶段三若引入 session/cookie 鉴权再开启，开启时 `allowed-origin-patterns` 不能含 `*` |
+| `aivoice.cors.max-age` | `1h` | yaml | 浏览器对 OPTIONS 预检结果的缓存时长，缩短到秒级会显著增加预检请求量 |
+
+#### 设计要点
+
+1. **路径范围限定**：`path-pattern: /api/**` 让 CORS 只对业务 API 生效，不污染管理 / 文档端点。Swagger UI、Actuator 都是同源访问，本就不走 CORS。
+2. **`allowedOriginPatterns` vs `allowedOrigins`**：Spring 6.0+ 严格要求带凭证的 CORS 不能用 `*` 通配，但 `allowedOriginPatterns` 支持 `http://localhost:[*]` 这种端口通配 / `https://*.aivoice.cloudzao.com` 这种二级域通配；本项目统一只用 patterns。
+3. **fail-fast 启动校验**：[CorsConfig.validate()](../aivoice-common/src/main/java/com/cloudzao/aivoice/common/config/CorsConfig.java) 在容器启动时校验：
+   - `path-pattern` 不能为空
+   - `allowed-origin-patterns` 不能为空（强制业务方显式声明信任的来源）
+   - `allow-credentials=true` 与 `allowed-origin-patterns` 含 `*` 不能共存（Spring 也会拒绝，提前到启动期暴露）
+4. **SSE 流式接口透明覆盖**：`/api/v1/agents/chat/stream` 落在 `path-pattern: /api/**` 内，`SseEmitter` 的响应头会被 Spring 的 `CorsInterceptor` 自动叠加 CORS 头；浏览器 `EventSource` 按 SSE 标准走 CORS 流程，无需额外代码。
+5. **生产环境收紧**：上线前**必须**把 `allowed-origin-patterns` 收敛到具体业务域（如 `https://app.aivoice.cloudzao.com`、`https://*.aivoice.cloudzao.com`），不要保留 `localhost` / `capacitor://localhost` 这些开发兜底项；推荐通过 `application-prod.yaml` 整体覆盖该列表，或注入 `AIVOICE_CORS_ALLOWED_ORIGINS` 环境变量。
+
+#### 端到端验证
+
+应用启动后，可用如下 `curl` 命令验证 CORS 头是否按预期返回（响应头需精确匹配 `Origin`，不是 `*`）：
+
+```bash
+# 1. 允许的 origin → 200，回显具体来源
+curl -i -X OPTIONS http://127.0.0.1:8080/api/v1/agents/chat \
+  -H "Origin: http://localhost:5173" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: Content-Type"
+# 期望响应头：
+#   Access-Control-Allow-Origin: http://localhost:5173
+#   Access-Control-Allow-Methods: GET,POST,PUT,DELETE,OPTIONS,HEAD
+#   Access-Control-Allow-Headers: Content-Type
+#   Access-Control-Max-Age: 3600
+#   Vary: Origin
+
+# 2. 不在白名单的 origin → 403
+curl -i -X OPTIONS http://127.0.0.1:8080/api/v1/agents/chat \
+  -H "Origin: https://evil.example.com" \
+  -H "Access-Control-Request-Method: POST"
+# 期望响应：HTTP/1.1 403，且不带 Access-Control-Allow-Origin
+```
+
+集成测试覆盖 4 个核心场景，参见 [CorsIntegrationTest.java](../aivoice-app/src/test/java/com/cloudzao/aivoice/cors/CorsIntegrationTest.java)：允许的 localhost 端口通配、被拒的恶意 origin、精确域名 pattern、`/actuator/**` 路径不受 CORS 影响。
+
 ---
 
 ## 5. 启动与运行
@@ -513,13 +622,25 @@ $env:OPENCLAW_GATEWAY_TOKEN = "<your-token>"
 # 2. 编译并运行单元测试（不启动 Spring 上下文）
 .\mvnw.cmd -pl aivoice-agent -am test
 
-# 3. 启动应用（聚合模块）
-.\mvnw.cmd -pl aivoice-app -am spring-boot:run
+# 3.【铁律】凡是修改过任意子模块 pom.xml，先 install 再启动
+#   把最新 pom + jar 写入本地 ~/.m2，避免 spring-boot:run 时 maven
+#   从仓库拉陈旧的子模块 pom，导致新加依赖不进 classpath
+.\mvnw.cmd -DskipTests install
 
-# 4. 打可运行 jar（产物在 aivoice-app/target/）
+# 4. 启动应用
+#   推荐进 aivoice-app 子目录跑，避免 spring-boot:run 在 parent 上找不到 main class
+cd aivoice-app
+..\mvnw.cmd spring-boot:run
+cd ..
+
+# 5. 打可运行 jar（产物在 aivoice-app/target/）
 .\mvnw.cmd -pl aivoice-app -am package
 java -jar .\aivoice-app\target\aivoice-app-0.0.1-SNAPSHOT.jar
 ```
+
+> **避坑速查**：启动后 `/v3/api-docs`、`/swagger-ui.html` 等返回 500（`NoResourceFoundException`），
+> 但启动日志干净 + `Started AiVoiceApplication` 出现 + `/actuator/health` 返回 200 ——
+> 99% 是上面第 3 步 `mvn install` 没跑。回到根目录跑一次再启动即可。
 
 启动成功后日志关键标识：
 
@@ -626,7 +747,9 @@ curl -X POST http://127.0.0.1:8080/api/v1/agents/chat `
 - 阶段三接入 Spring Security + JWT 时，只需在受保护接口上加 `@SecurityRequirement(name = "bearerAuth")`
 - 客户端在 Swagger UI 右上角 "Authorize" 按钮中粘贴 JWT，即可在 Try-it-out 时自动带上 `Authorization: Bearer <jwt>`
 
-### 6.2 `POST /api/v1/agents/chat`
+### 6.2 `POST /api/v1/agents/chat`（同步）
+
+适合调用方"等完整结果再处理"的场景（如离线批处理、单元测试）。如果你是 Python ASR 服务想把 LLM 回复**逐字转推给 App**，请用 [§ 6.3 流式端点](#63-post-apiv1agentschatstream-sse-流式)。
 
 #### 请求体
 
@@ -675,7 +798,91 @@ curl -X POST http://127.0.0.1:8080/api/v1/agents/chat `
 }
 ```
 
-### 6.3 `GET /actuator/health`
+### 6.3 `POST /api/v1/agents/chat/stream`（SSE 流式）
+
+#### 请求体
+
+与 [§ 6.2](#62-post-apiv1agentschat) 完全一致（复用 `ChatRequest`），不同点仅在响应：
+
+```json
+{
+  "message": "你好，介绍一下自己",
+  "model": "openclaw",
+  "systemPrompt": "你是一个简洁的中文助手",
+  "temperature": 0.7
+}
+```
+
+#### 响应（HTTP 200，`Content-Type: text/event-stream`）
+
+每行 `data:` 即一段 LLM 增量文本（已剥离 OpenAI 协议外壳，**不是** JSON），按时间顺序到达：
+
+```
+data: 你
+
+data: 好
+
+data: ，
+
+data: 我是
+
+data: AIVoice 助手
+
+```
+
+- 服务端把上游 `data: [DONE]` 吸收掉，**客户端不会收到** —— 按 SSE 标准等待连接关闭即可
+- 服务端不发 `event:`、`id:`、`retry:` 等其它 SSE 字段
+- 错误处理：连接已建立后才出问题（如上游 token 失效），由 `SseEmitter.completeWithError()` 触发，连接被中断，**不会**返 problem+json（响应头已发出，无法再换 status code）；连接尚未建立时（如参数校验 400）走全局异常处理器返 problem+json，与 `/chat` 一致
+
+#### Python 调用示例（推荐 STT → BE → 转推 App 的标准用法）
+
+```python
+import os
+import requests
+
+BE_URL = "http://127.0.0.1:8080/api/v1/agents/chat/stream"
+
+def stream_chat(stt_text: str):
+    """
+    把 STT 文本送到后端，逐字 yield LLM 回复。
+    Python ASR 服务可在拿到每个 chunk 后立刻推给 App（再做 TTS / 显示）。
+    """
+    with requests.post(
+        BE_URL,
+        json={"message": stt_text},
+        headers={"Accept": "text/event-stream"},
+        stream=True,
+        timeout=(5, 300),  # connect 5s, read 5min
+    ) as resp:
+        resp.raise_for_status()
+        for raw in resp.iter_lines(decode_unicode=False):
+            if not raw or not raw.startswith(b"data:"):
+                continue
+            chunk = raw[len(b"data:"):].lstrip().decode("utf-8")
+            yield chunk
+
+if __name__ == "__main__":
+    full_reply = []
+    for piece in stream_chat("用户语音转出来的文本"):
+        print(piece, end="", flush=True)
+        full_reply.append(piece)
+    print()
+    print("---FULL REPLY---")
+    print("".join(full_reply))
+```
+
+#### curl 调试命令（本地）
+
+```powershell
+curl -N -X POST http://127.0.0.1:8080/api/v1/agents/chat/stream `
+     -H "Content-Type: application/json" `
+     -H "Accept: text/event-stream" `
+     -d '{\"message\":\"你好\"}'
+```
+
+`-N`（`--no-buffer`）让 curl 不缓冲输出，看得到逐字流式效果。
+
+### 6.4 `GET /actuator/health`
 
 ```json
 {
@@ -698,13 +905,14 @@ curl -X POST http://127.0.0.1:8080/api/v1/agents/chat `
 
 ## 7. 单元测试
 
-[OpenClawHttpClientTest.java](../aivoice-agent/src/test/java/com/cloudzao/aivoice/agent/llm/OpenClawHttpClientTest.java) 使用 Spring `MockRestServiceServer` 模拟上游，覆盖 4 个核心场景，**无需真实启动 OpenClaw Gateway** 即可在 CI 中运行：
+[OpenClawHttpClientTest.java](../aivoice-agent/src/test/java/com/cloudzao/aivoice/agent/llm/OpenClawHttpClientTest.java) 使用 Spring `MockRestServiceServer` 模拟上游，覆盖 5 个核心场景，**无需真实启动 OpenClaw Gateway** 即可在 CI 中运行：
 
 | 用例 | 目标 |
 | --- | --- |
 | `chatCompletion_returnsParsedResponse_on200` | 验证 happy path：请求头携带 Bearer Token、Content-Type 为 JSON，响应能被正确反序列化为 `ChatCompletionResponse`，且 `Usage` 下划线字段正确映射 |
 | `chatCompletion_throwsOpenClawException_on401` | 验证 401 上游错误被包装为 `OpenClawException`，保留原始 status 与 body |
 | `chatCompletion_throws503_whenGatewayUnreachable` | 模拟 `IOException("Connection refused")`，验证网络层错误被人为映射为 `status=503` 的 `OpenClawException` |
+| `chatCompletionStream_emitsChunks_andCallsCompleteOnDone` | 验证流式：mock 多行 SSE（含 `[DONE]`），`onContent` 按序收到各 delta 文本、`onComplete` 调用 1 次、`[DONE]` 不被透传、`onError` 未触发 |
 | `listModelsRaw_returnsRawJson_on200` | 验证健康探活路径返回原始 JSON 字符串，请求头同样携带 Bearer Token |
 
 ```63:101:aivoice-agent/src/test/java/com/cloudzao/aivoice/agent/llm/OpenClawHttpClientTest.java
@@ -757,7 +965,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/agents/chat `
 
 当前实现严格控制在"打通同步链路"，以下能力**有意未做**，避免过度设计：
 
-- ❌ **无流式（SSE/WebSocket）**：`stream=false` 硬编码，UI 上无逐字输出体验
+- ✅ **SSE 流式已支持**：`POST /chat/stream` 端点逐字推 LLM 增量；但仍 ❌ **无 WebSocket**（双向流暂不需要）
 - ❌ **无会话上下文**：每次请求独立，不维护多轮对话历史
 - ❌ **无鉴权 / 多租户**：`/api/v1/agents/chat` 公开访问，没有 user / device 维度
 - ❌ **无限流 / 熔断**：上游故障时只能依赖 60s 读超时
@@ -768,7 +976,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/agents/chat `
 
 | 阶段 | 目标 | 关键改动 |
 | --- | --- | --- |
-| **阶段二** | 流式对话 + 会话上下文 | 引入 `WebClient` + SSE；新增 `ConversationService` 持久化历史（Redis / PostgreSQL）|
+| **阶段二** | 会话上下文（流式已在 v1.2 落地） | 新增 `ConversationService` 持久化历史（Redis / PostgreSQL），让 `/chat` 与 `/chat/stream` 都支持 `sessionId` 多轮 |
 | **阶段三** | 鉴权 + 多租户 | 接入 Spring Security + JWT；`aivoice-user` 模块落地用户/设备模型；启用 `OpenApiConfig` 已预留的 `bearerAuth` SecurityScheme，并对受保护接口加 `@SecurityRequirement(name = "bearerAuth")` |
 | **阶段四** | 计费 + 可观测性 | `OpenClawHttpClient` 成功路径发 Kafka `usage_event`；接入 Prometheus + OpenTelemetry |
 | **阶段五** | 弹性 | Resilience4j 熔断 / 重试 / 隔离舱；多 Gateway 实例的负载均衡 |
@@ -795,3 +1003,17 @@ curl -X POST http://127.0.0.1:8080/api/v1/agents/chat `
 >
 > - 2026-06-11 v1.0 初版，覆盖 MVP 阶段一全链路
 > - 2026-06-11 v1.1 接入 springdoc-openapi 2.8.17，控制器/DTO 全量注解化；新增 `4.3 OpenAPI 配置项`、`6.1 在线 OpenAPI 文档（Swagger UI）` 两节；`OpenApiConfig` 预留 `bearerAuth` 安全方案
+> - 2026-06-12 v1.2 新增 `POST /api/v1/agents/chat/stream` SSE 流式端点（适配 Python ASR 服务转推 App 场景）；`ChatService` 抽出 `buildUpstreamRequest` 共用 helper、新增 `chatStream(req, emitter)`；`OpenClawClient` 新增 `chatCompletionStream(...)` 回调式签名；新增 `AsyncConfig.chatStreamExecutor` 线程池；`OpenClawHttpClientTest` 增加 1 个流式用例（共 5 个）；§3.2 / §3.3 / §6.2 / §6.3 / §8.1 / §8.2 同步更新
+> - 2026-06-12 v1.3 **尝试 → 回滚 → 复盘** 接入 Knife4j 4.5.0 增强 UI（`/doc.html`）。
+>   - 第一次回滚原因（**事后已证伪**）：曾推断 Knife4j starter 在运行时废掉了 springdoc 的 `OpenApiResource` / `SwaggerWelcomeWebMvc` controller 注册（依据是启动日志干净但端点全 500）。
+>   - **真正根因**：本项目自 v1.1 起从未跑过 `mvn install`，本地 `~/.m2` 中的 `aivoice-common-0.0.1-SNAPSHOT.pom` 一直停留在 v1.0 时期（**无 springdoc 依赖**）。`cd aivoice-app && ./mvnw spring-boot:run` 是单模块模式，从 m2 拉陈旧子模块 pom，所以 springdoc / knife4j 都没进 classpath，所有 OpenAPI 端点直接 500 —— 这跟 Knife4j 自身有没有 bug **完全无关**。验证：在回滚为纯 springdoc 之后，未跑 install 时 `/swagger-ui.html` 仍然 500；跑一次 `./mvnw -DskipTests install` 后立刻恢复 200。
+>   - 因此 v1.3 此次仍维持回滚（**已无证据表明 Knife4j 4.5.0 在 Boot 3.5 + springdoc 2.8.17 下不可用**），但同时把"修改任意子模块 pom 后必须先 install 再 spring-boot:run"这条铁律写入文档头部与 §5 启动章节，避免后人重蹈覆辙。后续若仍想要 Knife4j UI，应在 install 后重新评估
+> - 2026-06-12 v1.4 接入全局 CORS 处理：
+>   - 新增 `aivoice-common/config/CorsProperties.java`（`@ConfigurationProperties(prefix="aivoice.cors")` record）与 `aivoice-common/config/CorsConfig.java`（`WebMvcConfigurer` + fail-fast 校验 + `@ConditionalOnProperty` 总开关）
+>   - `application.yaml` 新增 `aivoice.cors.*` 配置块；默认放行 `localhost` 端口通配 + `capacitor://localhost` 等混合 App origin；生产域名通过 `AIVOICE_CORS_ALLOWED_ORIGINS` 环境变量或 `application-prod.yaml` 覆盖
+>   - 选用 `allowedOriginPatterns` 而非 `allowedOrigins`（Spring 6.0+ 在带凭证时不允许 `*`，patterns 形式支持 `http://localhost:[*]` 等通配）
+>   - `path-pattern: /api/**` 让 CORS 不污染 `/actuator/**`、`/swagger-ui/**`、`/v3/api-docs/**` 等同源访问端点
+>   - SSE 流式接口 `/api/v1/agents/chat/stream` 自动覆盖，无需额外处理
+>   - 新增 `aivoice-app/test/cors/CorsIntegrationTest.java`，4 个 OPTIONS 预检用例覆盖：localhost 端口通配放行 / 恶意 origin 拒绝 / 精确域名放行 / actuator 路径无 CORS 头
+>   - 启动期 OPTIONS / POST 实战验证：`Access-Control-Allow-Origin` 精确回显请求 origin、`Vary: Origin` 防 CDN 误缓存、错误响应（如 400 校验失败）也带 CORS 头让浏览器能读到错误体
+>   - 文档：§3.4 新增 CorsProperties + CorsConfig 子段、§4 主配置 yaml 片段加入 cors 块、§4.4 新增"跨域（CORS）配置项"完整章节

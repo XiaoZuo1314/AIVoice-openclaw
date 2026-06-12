@@ -16,7 +16,10 @@ import org.springframework.web.client.RestClient;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -142,6 +145,46 @@ class OpenClawHttpClientTest {
                     }
                 });
         server.verify();
+    }
+
+    @Test
+    void chatCompletionStream_emitsChunks_andCallsCompleteOnDone() {
+        String sseBody = """
+                data: {"id":"1","model":"openclaw","choices":[{"index":0,"delta":{"role":"assistant","content":"你"},"finish_reason":null}]}
+
+                data: {"id":"1","model":"openclaw","choices":[{"index":0,"delta":{"content":"好"},"finish_reason":null}]}
+
+                data: {"id":"1","model":"openclaw","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+                data: [DONE]
+
+                """;
+
+        server.expect(requestTo(BASE_URL + CHAT_PATH))
+                .andExpect(method(org.springframework.http.HttpMethod.POST))
+                .andExpect(header(HttpHeaders.AUTHORIZATION, "Bearer test-token"))
+                .andRespond(withSuccess(sseBody, MediaType.TEXT_EVENT_STREAM));
+
+        ChatCompletionRequest req = new ChatCompletionRequest(
+                "openclaw",
+                List.of(ChatMessage.user("hi")),
+                false,
+                null);
+
+        List<String> contents = new ArrayList<>();
+        AtomicBoolean completed = new AtomicBoolean(false);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+
+        client.chatCompletionStream(
+                req,
+                contents::add,
+                () -> completed.set(true),
+                error::set);
+
+        server.verify();
+        assertThat(contents).containsExactly("你", "好");
+        assertThat(completed).isTrue();
+        assertThat(error.get()).isNull();
     }
 
     @Test

@@ -18,3 +18,22 @@ management:
     web:
       exposure:
         include: health,info
+
+aivoice:
+  cors:
+    enabled: true
+    path-pattern: /api/**
+    allowed-origin-patterns:
+      - http://localhost:[*]
+      - http://127.0.0.1:[*]
+      - https://app.test.aivoice.cloudzao.com
+    allowed-methods:
+      - GET
+      - POST
+      - OPTIONS
+    allowed-headers:
+      - "*"
+    exposed-headers:
+      - Content-Disposition
+    allow-credentials: false
+    max-age: 1h
