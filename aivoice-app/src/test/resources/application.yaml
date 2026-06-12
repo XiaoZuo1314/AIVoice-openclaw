@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: AIVoice-test
+
+openclaw:
+  base-url: http://127.0.0.1:18789
+  token: test-token
+  default-model: openclaw
+  endpoint:
+    chat: /v1/chat/completions
+    models: /v1/models
+  timeout:
+    connect: 1s
+    read: 5s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

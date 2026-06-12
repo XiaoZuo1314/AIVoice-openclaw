@@ -1,0 +1,51 @@
+spring:
+  application:
+    name: AIVoice
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
+
+server:
+  port: 8080
+  error:
+    include-stacktrace: never
+
+openclaw:
+  base-url: ${OPENCLAW_GATEWAY_URL:http://127.0.0.1:18789}
+  token: ${OPENCLAW_GATEWAY_TOKEN:replace-with-real-token}
+  default-model: ${OPENCLAW_DEFAULT_MODEL:openclaw}
+  endpoint:
+    chat: /v1/chat/completions
+    models: /v1/models
+  timeout:
+    connect: 5s
+    read: 60s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+    enabled: true
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: alpha
+    tags-sorter: alpha
+    display-request-duration: true
+    try-it-out-enabled: true
+  packages-to-scan: com.cloudzao.aivoice
+  paths-to-match: /api/**
+  default-produces-media-type: application/json
+  show-actuator: false
+
+logging:
+  level:
+    com.cloudzao.aivoice: INFO

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.cloudzao</groupId>
+        <artifactId>aivoice-parent</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>aivoice-user</artifactId>
+    <name>aivoice-user</name>
+    <description>用户与设备管理业务模块（当前为空壳占位）</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.cloudzao</groupId>
+            <artifactId>aivoice-common</artifactId>
+        </dependency>
+    </dependencies>
+</project>
